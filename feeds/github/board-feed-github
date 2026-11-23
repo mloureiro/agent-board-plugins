@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+PROTOCOL = 1
+ACTION = "list-pull-requests"
+FIELDS = ["url", "title", "updatedAt", "status", "labels"]
+
+QUERY_PATTERN = r"^[^\x00-\x1f\x7f]+$"
+REPOSITORY_PATTERN = r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+OPTION_NAMES = ("query", "repositories", "settleMinutes")
+QUERY_MAX = 256
+REPOSITORIES_MAX = 50
+SETTLE_MAX = 120
+SETTLE_DEFAULT = 10
+
+PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)")
+HEAD_SHA = re.compile(r"[0-9a-f]{40,64}")
+CONTROLS = re.compile("[\x00-\x1f\x7f-\x9f  \\\\]")
+SPACES = re.compile(" {2,}")
+
+TITLE_MAX = 200
+FIELD_MAX = 500
+REASON_MAX = 200
+GH_TIMEOUT = 100
+GH_QUICK_TIMEOUT = 25
+
+USAGE = "usage: board-feed-github describe | doctor | check list-pull-requests | list-pull-requests"
+
+GRAPHQL = """query($q: String!, $endCursor: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        url
+        number
+        title
+        updatedAt
+        isDraft
+        reviewDecision
+        headRefOid
+        repository { nameWithOwner }
+        labels(first: 20) { nodes { name } }
+        commits(last: 1) { nodes { commit { committedDate } } }
+        timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 1) {
+          nodes { ... on ReviewRequestedEvent { createdAt } }
+        }
+      }
+    }
+  }
+}"""
+
+
+class Failure(Exception):
+    pass
+
+
+def clean(text, limit):
+    if not isinstance(text, str):
+        return ""
+    return SPACES.sub(" ", CONTROLS.sub(" ", text)).strip()[:limit]
+
+
+def first_line(text):
+    for line in text.splitlines():
+        if line.strip():
+            return clean(line, REASON_MAX)
+    return ""
+
+
+def describe_document():
+    return {
+        "protocol": PROTOCOL,
+        "actions": {
+            ACTION: {
+                "summary": "Open pull requests that match a GitHub search, one item per PR",
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": QUERY_MAX,
+                            "pattern": QUERY_PATTERN,
+                            "description": "A GitHub search, such as: is:open draft:false review-requested:@me. is:pr is added when absent.",
+                        },
+                        "repositories": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": REPOSITORIES_MAX,
+                            "items": {"type": "string", "maxLength": 200, "pattern": REPOSITORY_PATTERN},
+                            "description": "owner/name repositories; each adds repo:<owner/name> to the search.",
+                        },
+                        "settleMinutes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": SETTLE_MAX,
+                            "default": SETTLE_DEFAULT,
+                            "description": "A pull request whose head commit is younger than this waits in Todo until it settles.",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                "fields": FIELDS,
+            }
+        },
+    }
+
+
+def validate_options(value):
+    if not isinstance(value, dict):
+        raise Failure("options must be a JSON object")
+    for name in value:
+        if name not in OPTION_NAMES:
+            raise Failure("options has no option %s" % json.dumps(clean(str(name), 40)))
+    query = value.get("query")
+    if not isinstance(query, str) or not 1 <= len(query) <= QUERY_MAX:
+        raise Failure("options.query must be text of 1 to %d characters" % QUERY_MAX)
+    if not re.fullmatch(QUERY_PATTERN, query) or query.strip() == "":
+        raise Failure("options.query must not be empty or hold control characters")
+    repositories = value.get("repositories", [])
+    if "repositories" in value:
+        if not isinstance(repositories, list) or not 1 <= len(repositories) <= REPOSITORIES_MAX:
+            raise Failure("options.repositories must list 1 to %d repositories" % REPOSITORIES_MAX)
+        for index, repository in enumerate(repositories):
+            if not isinstance(repository, str) or not re.fullmatch(REPOSITORY_PATTERN, repository):
+                raise Failure("options.repositories[%d] must look like owner/name" % index)
+    settle = value.get("settleMinutes", SETTLE_DEFAULT)
+    if isinstance(settle, bool) or not isinstance(settle, int) or not 0 <= settle <= SETTLE_MAX:
+        raise Failure("options.settleMinutes must be a whole number from 0 to %d" % SETTLE_MAX)
+    return {"query": query.strip(), "repositories": repositories, "settleMinutes": settle}
+
+
+def read_options():
+    try:
+        value = json.loads(sys.stdin.read())
+    except ValueError:
+        raise Failure("options are not valid JSON")
+    return validate_options(value)
+
+
+def build_search(options):
+    parts = [options["query"]]
+    if not any(token.lower() in ("is:pr", "type:pr") for token in options["query"].split()):
+        parts.append("is:pr")
+    parts.extend("repo:%s" % repository for repository in options["repositories"])
+    return " ".join(parts)
+
+
+def run_gh(args, timeout):
+    environment = dict(os.environ, GH_PROMPT_DISABLED="1")
+    try:
+        result = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=timeout, env=environment)
+    except subprocess.TimeoutExpired:
+        raise Failure("gh did not answer within %d seconds" % timeout)
+    except OSError as error:
+        raise Failure("gh could not run: %s" % clean(str(error), REASON_MAX))
+    if result.returncode != 0:
+        raise Failure(first_line(result.stderr) or "gh exited with status %d" % result.returncode)
+    return result.stdout
+
+
+def parse_pages(text):
+    decoder = json.JSONDecoder()
+    pages = []
+    position = 0
+    while True:
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text):
+            return pages
+        try:
+            page, position = decoder.raw_decode(text, position)
+        except ValueError:
+            raise Failure("gh answered with text that is not JSON")
+        pages.append(page)
+
+
+def search_nodes(pages):
+    nodes = []
+    for page in pages:
+        if not isinstance(page, dict) or page.get("errors"):
+            raise Failure("GitHub answered with an error")
+        data = page.get("data")
+        search = data.get("search") if isinstance(data, dict) else None
+        found = search.get("nodes") if isinstance(search, dict) else None
+        if not isinstance(found, list):
+            raise Failure("GitHub's answer has no search results")
+        nodes.extend(node for node in found if isinstance(node, dict))
+    return nodes
+
+
+def parse_time(text):
+    if not isinstance(text, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def nested(node, *path):
+    for step in path:
+        if isinstance(node, dict):
+            node = node.get(step)
+        elif isinstance(node, list) and node and isinstance(step, int):
+            node = node[step] if -len(node) <= step < len(node) else None
+        else:
+            return None
+    return node
+
+
+def status_of(node):
+    if node.get("isDraft") is True:
+        return "draft"
+    decision = node.get("reviewDecision")
+    if decision == "CHANGES_REQUESTED":
+        return "changes-requested"
+    if decision == "APPROVED":
+        return "approved"
+    return "open"
+
+
+def build_item(node, settle_minutes, now):
+    url = node.get("url")
+    matched = PR_URL.fullmatch(url) if isinstance(url, str) else None
+    if matched is None:
+        return None
+    repository = nested(node, "repository", "nameWithOwner")
+    if not isinstance(repository, str) or not re.fullmatch(REPOSITORY_PATTERN, repository):
+        repository = matched.group(1)
+    title = clean(node.get("title"), FIELD_MAX)
+    labels = [clean(label.get("name"), 100) for label in (nested(node, "labels", "nodes") or []) if isinstance(label, dict)]
+    item = {
+        "key": url,
+        "title": clean("%s#%s %s" % (repository, matched.group(2), title), TITLE_MAX),
+        "repo": repository,
+        "fields": {
+            "url": url,
+            "title": title,
+            "updatedAt": clean(node.get("updatedAt"), 40),
+            "status": status_of(node),
+            "labels": clean(", ".join(label for label in labels if label), FIELD_MAX),
+        },
+    }
+    head = node.get("headRefOid")
+    if isinstance(head, str) and HEAD_SHA.fullmatch(head):
+        requested = clean(nested(node, "timelineItems", "nodes", -1, "createdAt"), 40)
+        item["version"] = head + ("@" + requested if requested else "")
+    committed = parse_time(nested(node, "commits", "nodes", -1, "commit", "committedDate"))
+    if committed is not None and settle_minutes > 0:
+        settled = committed + timedelta(minutes=settle_minutes)
+        if settled > now:
+            item["notBefore"] = settled.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return item
+
+
+def list_pull_requests():
+    options = read_options()
+    stdout = run_gh(
+        [
+            "api",
+            "graphql",
+            "--paginate",
+            "-f",
+            "query=" + GRAPHQL,
+            "-f",
+            "q=" + build_search(options),
+        ],
+        GH_TIMEOUT,
+    )
+    now = datetime.now(timezone.utc)
+    items = {}
+    for node in search_nodes(parse_pages(stdout)):
+        item = build_item(node, options["settleMinutes"], now)
+        if item is not None and item["key"] not in items:
+            items[item["key"]] = item
+    if items:
+        sys.stdout.write("".join(json.dumps(item) + "\n" for item in items.values()))
+
+
+def doctor():
+    if shutil.which("gh") is None:
+        raise Failure("gh is not installed: https://cli.github.com")
+    try:
+        result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=GH_QUICK_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        raise Failure("gh did not answer: run gh auth status")
+    if result.returncode != 0:
+        raise Failure("gh is not logged in: run gh auth login")
+    print("gh found and logged in")
+
+
+def main(argv):
+    verb = argv[0] if argv else None
+    rest = argv[1:]
+    try:
+        if verb == "describe" and not rest:
+            print(json.dumps(describe_document()))
+        elif verb == "doctor" and not rest:
+            doctor()
+        elif verb == "check" and rest == [ACTION]:
+            read_options()
+        elif verb == ACTION and not rest:
+            list_pull_requests()
+        else:
+            print(USAGE, file=sys.stderr)
+            return 2
+    except Failure as failure:
+        print(str(failure), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
