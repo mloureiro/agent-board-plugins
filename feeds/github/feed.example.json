@@ -1,0 +1,17 @@
+{
+  "integration": "mloureiro:github",
+  "action": "list-pull-requests",
+  "options": {
+    "repositories": ["acme/app", "acme/infra"],
+    "query": "is:open draft:false review-requested:@me"
+  },
+  "every": "10m",
+  "dir": "~/workspace/acme/app",
+  "agent": "reviewer",
+  "lane": "reviews",
+  "timeout": "2m",
+  "prompts": {
+    "new": "/review-pr {url} --auto",
+    "update": "{url} changed since your last review (new commits or a new review request). Review it again: /review-pr {url} --auto"
+  }
+}
