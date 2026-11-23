@@ -2,5 +2,10 @@
   "protocol": 1,
   "name": "mloureiro",
   "description": "Feed integrations for agent-board",
-  "feeds": {}
+  "feeds": {
+    "github": {
+      "program": "feeds/github/board-feed-github",
+      "description": "Pull requests that match a GitHub search"
+    }
+  }
 }
